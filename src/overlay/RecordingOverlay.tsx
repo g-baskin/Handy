@@ -17,6 +17,7 @@ const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
   const [state, setState] = useState<OverlayState>("recording");
+  const [partialText, setPartialText] = useState<string>("");
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
   const direction = getLanguageDirection(i18n.language);
@@ -29,13 +30,23 @@ const RecordingOverlay: React.FC = () => {
         await syncLanguageFromSettings();
         const overlayState = event.payload as OverlayState;
         setState(overlayState);
+        setPartialText(""); // Reset partial text on state change
         setIsVisible(true);
       });
 
       // Listen for hide-overlay event from Rust
       const unlistenHide = await listen("hide-overlay", () => {
         setIsVisible(false);
+        setPartialText("");
       });
+
+      // Listen for partial transcription results
+      const unlistenPartial = await listen<string>(
+        "transcription-partial",
+        (event) => {
+          setPartialText(event.payload);
+        },
+      );
 
       // Listen for mic-level updates
       const unlistenLevel = await listen<number[]>("mic-level", (event) => {
@@ -55,6 +66,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
+        unlistenPartial();
         unlistenLevel();
       };
     };
@@ -93,7 +105,10 @@ const RecordingOverlay: React.FC = () => {
             ))}
           </div>
         )}
-        {state === "transcribing" && (
+        {state === "transcribing" && partialText && (
+          <div className="partial-text">{partialText}</div>
+        )}
+        {state === "transcribing" && !partialText && (
           <div className="transcribing-text">{t("overlay.transcribing")}</div>
         )}
         {state === "processing" && (
