@@ -420,7 +420,14 @@ impl ShortcutAction for TranscribeAction {
 
                 let transcription_time = Instant::now();
                 let samples_clone = samples.clone(); // Clone for history saving
-                match tm.transcribe(samples) {
+
+                // Use progressive transcription for audio longer than 3 seconds (48000 samples at 16kHz)
+                let transcription_result = if samples.len() >= 48000 {
+                    tm.transcribe_progressive(samples, &ah)
+                } else {
+                    tm.transcribe(samples)
+                };
+                match transcription_result {
                     Ok(transcription) => {
                         debug!(
                             "Transcription completed in {:?}: '{}'",

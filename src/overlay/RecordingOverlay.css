@@ -70,6 +70,35 @@
   }
 }
 
+.partial-text {
+  color: white;
+  font-size: 11px;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl; /* Show trailing (most recent) text when truncated */
+  text-align: left;
+  max-width: 100px;
+}
+
+.partial-text::after {
+  content: "▎";
+  animation: cursor-blink 0.8s step-end infinite;
+  margin-inline-start: 1px;
+}
+
+@keyframes cursor-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
 .cancel-button {
   width: 24px;
   height: 24px;

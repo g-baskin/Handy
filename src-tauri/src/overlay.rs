@@ -354,6 +354,13 @@ pub fn hide_recording_overlay(app_handle: &AppHandle) {
     }
 }
 
+/// Emits partial transcription text to the overlay window
+pub fn emit_partial_transcription(app_handle: &AppHandle, text: &str) {
+    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
+        let _ = overlay_window.emit("transcription-partial", text);
+    }
+}
+
 pub fn emit_levels(app_handle: &AppHandle, levels: &Vec<f32>) {
     // emit levels to main app
     let _ = app_handle.emit("mic-level", levels);

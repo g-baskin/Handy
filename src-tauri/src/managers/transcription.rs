@@ -403,6 +403,238 @@ impl TranscriptionManager {
         current_model.clone()
     }
 
+    /// Transcribe audio progressively, emitting partial results to the overlay.
+    /// Splits audio into growing chunks (3s, 6s, 9s, ...) and transcribes each,
+    /// emitting partial text after each chunk. Returns the final full transcription.
+    pub fn transcribe_progressive(
+        &self,
+        audio: Vec<f32>,
+        app_handle: &AppHandle,
+    ) -> Result<String> {
+        const SAMPLE_RATE: usize = 16000;
+        const CHUNK_SECONDS: usize = 3;
+        const CHUNK_SAMPLES: usize = SAMPLE_RATE * CHUNK_SECONDS;
+        const MIN_SAMPLES_FOR_PROGRESSIVE: usize = SAMPLE_RATE * CHUNK_SECONDS;
+
+        // Too short for progressive — just do batch
+        if audio.len() < MIN_SAMPLES_FOR_PROGRESSIVE {
+            return self.transcribe(audio);
+        }
+
+        // Update last activity timestamp
+        self.last_activity.store(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            Ordering::Relaxed,
+        );
+
+        let st = std::time::Instant::now();
+
+        // Wait for model loading
+        {
+            let mut is_loading = self.is_loading.lock().unwrap();
+            while *is_loading {
+                is_loading = self.loading_condvar.wait(is_loading).unwrap();
+            }
+
+            let engine_guard = self.lock_engine();
+            if engine_guard.is_none() {
+                return Err(anyhow::anyhow!("Model is not loaded for transcription."));
+            }
+        }
+
+        let settings = get_settings(&self.app_handle);
+
+        // Take the engine out once for all chunks
+        let mut engine_guard = self.lock_engine();
+        let mut engine = match engine_guard.take() {
+            Some(e) => e,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Model failed to load. Please check your model settings."
+                ));
+            }
+        };
+        drop(engine_guard);
+
+        // Build chunk boundaries: 3s, 6s, 9s, ..., full audio
+        let mut chunk_ends: Vec<usize> = Vec::new();
+        let mut end = CHUNK_SAMPLES;
+        while end < audio.len() {
+            chunk_ends.push(end);
+            end += CHUNK_SAMPLES;
+        }
+        chunk_ends.push(audio.len()); // Always include full audio as final chunk
+
+        let mut last_text = String::new();
+
+        for &chunk_end in &chunk_ends {
+            let chunk = &audio[..chunk_end];
+            let is_final = chunk_end == audio.len();
+
+            let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<transcribe_rs::TranscriptionResult> {
+                match &mut engine {
+                    LoadedEngine::Whisper(whisper_engine) => {
+                        let whisper_language = if settings.selected_language == "auto" {
+                            None
+                        } else {
+                            let normalized = if settings.selected_language == "zh-Hans"
+                                || settings.selected_language == "zh-Hant"
+                            {
+                                "zh".to_string()
+                            } else {
+                                settings.selected_language.clone()
+                            };
+                            Some(normalized)
+                        };
+                        let params = WhisperInferenceParams {
+                            language: whisper_language,
+                            translate: settings.translate_to_english,
+                            ..Default::default()
+                        };
+                        whisper_engine
+                            .transcribe_samples(chunk.to_vec(), Some(params))
+                            .map_err(|e| anyhow::anyhow!("Whisper transcription failed: {}", e))
+                    }
+                    LoadedEngine::Parakeet(parakeet_engine) => {
+                        let params = ParakeetInferenceParams {
+                            timestamp_granularity: TimestampGranularity::Segment,
+                            ..Default::default()
+                        };
+                        parakeet_engine
+                            .transcribe_samples(chunk.to_vec(), Some(params))
+                            .map_err(|e| anyhow::anyhow!("Parakeet transcription failed: {}", e))
+                    }
+                    LoadedEngine::Moonshine(moonshine_engine) => moonshine_engine
+                        .transcribe_samples(chunk.to_vec(), None)
+                        .map_err(|e| anyhow::anyhow!("Moonshine transcription failed: {}", e)),
+                    LoadedEngine::MoonshineStreaming(streaming_engine) => streaming_engine
+                        .transcribe_samples(chunk.to_vec(), None)
+                        .map_err(|e| anyhow::anyhow!("Moonshine streaming transcription failed: {}", e)),
+                    LoadedEngine::SenseVoice(sense_voice_engine) => {
+                        let language = match settings.selected_language.as_str() {
+                            "zh" | "zh-Hans" | "zh-Hant" => SenseVoiceLanguage::Chinese,
+                            "en" => SenseVoiceLanguage::English,
+                            "ja" => SenseVoiceLanguage::Japanese,
+                            "ko" => SenseVoiceLanguage::Korean,
+                            "yue" => SenseVoiceLanguage::Cantonese,
+                            _ => SenseVoiceLanguage::Auto,
+                        };
+                        let params = SenseVoiceInferenceParams {
+                            language,
+                            use_itn: true,
+                        };
+                        sense_voice_engine
+                            .transcribe_samples(chunk.to_vec(), Some(params))
+                            .map_err(|e| anyhow::anyhow!("SenseVoice transcription failed: {}", e))
+                    }
+                }
+            }));
+
+            match transcribe_result {
+                Ok(inner_result) => {
+                    match inner_result {
+                        Ok(result) => {
+                            last_text = result.text.clone();
+                            // Emit partial result for non-final chunks
+                            if !is_final && !last_text.is_empty() {
+                                crate::overlay::emit_partial_transcription(app_handle, &last_text);
+                                debug!(
+                                    "Progressive chunk {}/{} samples: '{}'",
+                                    chunk_end,
+                                    audio.len(),
+                                    last_text
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // Put engine back and return error
+                            let mut engine_guard = self.lock_engine();
+                            *engine_guard = Some(engine);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(panic_payload) => {
+                    // Engine panicked — don't put it back
+                    let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    error!(
+                        "Transcription engine panicked during progressive transcription: {}. Model has been unloaded.",
+                        panic_msg
+                    );
+                    {
+                        let mut current_model = self
+                            .current_model_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        *current_model = None;
+                    }
+                    let _ = self.app_handle.emit(
+                        "model-state-changed",
+                        ModelStateEvent {
+                            event_type: "unloaded".to_string(),
+                            model_id: None,
+                            model_name: None,
+                            error: Some(format!("Engine panicked: {}", panic_msg)),
+                        },
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Transcription engine panicked: {}. The model has been unloaded and will reload on next attempt.",
+                        panic_msg
+                    ));
+                }
+            }
+        }
+
+        // Put engine back
+        let mut engine_guard = self.lock_engine();
+        *engine_guard = Some(engine);
+        drop(engine_guard);
+
+        // Apply word correction
+        let corrected_result = if !settings.custom_words.is_empty() {
+            apply_custom_words(
+                &last_text,
+                &settings.custom_words,
+                settings.word_correction_threshold,
+            )
+        } else {
+            last_text
+        };
+
+        let filtered_result = filter_transcription_output(&corrected_result);
+
+        let et = std::time::Instant::now();
+        let translation_note = if settings.translate_to_english {
+            " (translated)"
+        } else {
+            ""
+        };
+        info!(
+            "Progressive transcription completed in {}ms{}",
+            (et - st).as_millis(),
+            translation_note
+        );
+
+        if filtered_result.is_empty() {
+            info!("Progressive transcription result is empty");
+        } else {
+            info!("Progressive transcription result: {}", filtered_result);
+        }
+
+        self.maybe_unload_immediately("progressive transcription");
+
+        Ok(filtered_result)
+    }
+
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
         // Update last activity timestamp
         self.last_activity.store(
